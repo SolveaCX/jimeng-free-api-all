@@ -19,7 +19,7 @@ feature/async-video-tasks
 当前部署提交：
 
 ```text
-8c7604dcc471fae753bc32921cab5a689f237339
+e64b3bae3a87c3b09c0f1e7498eb64a06d3f2b04
 ```
 
 鉴权方式使用即梦官网 Cookie 里的 `sessionid` 值：
