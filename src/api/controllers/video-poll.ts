@@ -25,8 +25,22 @@ export function extractVideoUrlFromResponse(result: any) {
     ...(result?.history_list || []),
     ...(result?.history_records || []),
   ];
+  if (result?.data && typeof result.data === 'object') {
+    historyRecords.push(...Object.values(result.data));
+  }
+  if (
+    result &&
+    typeof result === 'object' &&
+    !Array.isArray(result) &&
+    !result.history_list &&
+    !result.history_records
+  ) {
+    historyRecords.push(...Object.values(result));
+  }
+
   for (const record of historyRecords) {
-    const url = extractVideoUrlFromItemList(record?.item_list || []);
+    const itemList = (record as any)?.item_list || (record as any)?.origin_item_list || [];
+    const url = extractVideoUrlFromItemList(itemList);
     if (url) return url;
   }
 
@@ -40,6 +54,14 @@ function getFirstHistoryRecord(result: any) {
   const data = result?.data;
   if (data && typeof data === 'object') {
     const values = Object.values(data);
+    if (values.length > 0) return values[0];
+  }
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const values = Object.values(result).filter((value: any) =>
+      value &&
+      typeof value === 'object' &&
+      (value.history_record_id || value.item_list || value.origin_item_list || value.task)
+    );
     if (values.length > 0) return values[0];
   }
   return null;
@@ -63,8 +85,8 @@ export function normalizeVideoPollResult(result: any): VideoPollResult {
     };
   }
 
-  const status = historyData.status;
-  const failCode = historyData.fail_code;
+  const status = historyData.status ?? historyData.task?.status;
+  const failCode = historyData.fail_code ?? historyData.task?.fail_code;
 
   if (status === 30) {
     return {

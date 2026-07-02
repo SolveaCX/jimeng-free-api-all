@@ -4,7 +4,7 @@ import Request from '@/lib/request/Request.ts';
 import Response from '@/lib/response/Response.ts';
 import { tokenSplit } from '@/api/controllers/core.ts';
 import { generateVideoWithRetry, submitVideoGeneration, DEFAULT_MODEL } from '@/api/controllers/videos.ts';
-import { toVideoTaskResponse } from '@/api/controllers/video-tasks.ts';
+import { toVideoContentRedirectResponse, toVideoTaskResponse } from '@/api/controllers/video-tasks.ts';
 import util from '@/lib/util.ts';
 import db, { createVideoTask, getVideoTask } from '@/lib/database.ts';
 import APIException from '@/lib/exceptions/APIException.ts';
@@ -82,7 +82,7 @@ export default {
             if (task.status !== 'SUCCESS' || !task.result_url) {
                 return new Response(toVideoTaskResponse(task), { statusCode: 409 });
             }
-            return new Response(null, { redirect: task.result_url });
+            return toVideoContentRedirectResponse(task.result_url);
         }
 
     },

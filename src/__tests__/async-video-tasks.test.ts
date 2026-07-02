@@ -130,6 +130,42 @@ test("video poll result maps processing and failure states", async () => {
   });
 });
 
+test("video poll result maps raw Jimeng history map responses", async () => {
+  const { normalizeVideoPollResult } = await import("../api/controllers/video-poll.ts");
+
+  assert.deepEqual(normalizeVideoPollResult({
+    history_raw_processing: {
+      history_record_id: "history_raw_processing",
+      item_list: [],
+      task: { status: 20 },
+    },
+  }), {
+    status: "IN_PROGRESS",
+    progress: "50%",
+  });
+
+  assert.deepEqual(normalizeVideoPollResult({
+    history_raw_failed: {
+      history_record_id: "history_raw_failed",
+      item_list: [],
+      task: { status: 30, fail_code: "raw_failed" },
+    },
+  }), {
+    status: "FAILURE",
+    progress: "100%",
+    error: "视频生成失败: raw_failed",
+  });
+});
+
+test("completed video content redirect response is not converted to 204", async () => {
+  const { toVideoContentRedirectResponse } = await import("../api/controllers/video-tasks.ts");
+
+  const response = toVideoContentRedirectResponse("https://example.com/video.mp4");
+  assert.equal(response.statusCode, 302);
+  assert.equal(response.redirect, "https://example.com/video.mp4");
+  assert.equal(response.body, "");
+});
+
 test("video worker maps poll results to database updates", async () => {
   const { toVideoTaskUpdate } = await import("../lib/video-task-update.ts");
 

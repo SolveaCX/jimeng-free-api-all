@@ -1,4 +1,5 @@
 import type { VideoTaskRecord, VideoTaskStatus } from '@/lib/database.ts';
+import Response from '@/lib/response/Response.ts';
 
 export interface VideoTaskResponse {
   id: string;
@@ -55,4 +56,8 @@ export function toVideoTaskResponse(task: VideoTaskRecord): VideoTaskResponse {
     url: task.result_url || null,
     error: task.error || null,
   };
+}
+
+export function toVideoContentRedirectResponse(url: string) {
+  return new Response('', { statusCode: 302, redirect: url });
 }
