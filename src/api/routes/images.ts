@@ -1,12 +1,81 @@
 import _ from "lodash";
 
-import Request from "@/lib/request/Request.ts";
+import { ImageEditGenerationRequest, toImageEditGenerationRequest } from "@/api/adapters/image-edits.ts";
+import EX from "@/api/consts/exceptions.ts";
 import { DEFAULT_MODEL, generateImagesWithRetry } from "@/api/controllers/images.ts";
 import { tokenSplit } from "@/api/controllers/core.ts";
-import util from "@/lib/util.ts";
 import db from "@/lib/database.ts";
 import APIException from "@/lib/exceptions/APIException.ts";
-import EX from "@/api/consts/exceptions.ts";
+import Request from "@/lib/request/Request.ts";
+import util from "@/lib/util.ts";
+
+interface ImageGenerationRouteRequest {
+  model: string;
+  prompt: string;
+  negativePrompt?: string;
+  ratio?: string;
+  resolution?: string;
+  sampleStrength?: number;
+  responseFormat: string;
+  filePath?: string;
+}
+
+function chooseToken(authorization: string) {
+  const tokens = tokenSplit(authorization);
+  if (tokens.length === 0) {
+    throw new APIException(EX.API_REQUEST_PARAMS_INVALID, "Authorization token is empty");
+  }
+  return _.sample(tokens);
+}
+
+function firstUploadedFilePath(files: Record<string, any>) {
+  const fileKey = Object.keys(files || {})[0];
+  if (!fileKey) return undefined;
+
+  const file = Array.isArray(files[fileKey]) ? files[fileKey][0] : files[fileKey];
+  return file?.filepath || file?.path;
+}
+
+async function createImageGenerationResponse(
+  {
+    model,
+    prompt,
+    negativePrompt,
+    ratio,
+    resolution,
+    sampleStrength,
+    responseFormat,
+    filePath,
+  }: ImageGenerationRouteRequest | ImageEditGenerationRequest,
+  token: string
+) {
+  const imageUrls = await generateImagesWithRetry(model, prompt, {
+    ratio,
+    resolution,
+    sampleStrength,
+    negativePrompt,
+    filePath,
+  }, token);
+
+  try {
+    db.recordCall(token, model, 0);
+    imageUrls.forEach((url) => {
+      if (url) db.saveMedia("image", url, model, prompt, token);
+    });
+  } catch (e) {
+    // Statistics are best-effort and should not affect image generation.
+  }
+
+  const data = responseFormat === "b64_json"
+    ? (await Promise.all(imageUrls.map((url) => util.fetchFileBASE64(url))))
+      .map((b64) => ({ b64_json: b64 }))
+    : imageUrls.map((url) => ({ url }));
+
+  return {
+    created: util.unixTimestamp(),
+    data,
+  };
+}
 
 export default {
   prefix: "/v1/images",
@@ -23,13 +92,7 @@ export default {
         .validate("body.response_format", v => _.isUndefined(v) || _.isString(v))
         .validate("body.filePath", v => _.isUndefined(v) || _.isString(v))
         .validate("headers.authorization", _.isString);
-      // refresh_token切分
-      const tokens = tokenSplit(request.headers.authorization);
-      if (tokens.length === 0) {
-        throw new APIException(EX.API_REQUEST_PARAMS_INVALID, "Authorization token is empty");
-      }
-      // 随机挑选一个refresh_token
-      const token = _.sample(tokens);
+
       const {
         model = DEFAULT_MODEL,
         prompt,
@@ -40,53 +103,40 @@ export default {
         response_format,
         filePath: bodyFilePath,
       } = request.body;
-      
-      // 处理文件上传 (multipart/form-data)
-      let filePath = bodyFilePath;
-      // @ts-ignore
-      const files = request.files || {};
-      // 检查是否有上传的文件
-      if (!filePath && !_.isEmpty(files)) {
-        const fileKey = Object.keys(files)[0];
-        const file = files[fileKey];
-        if (file) {
-            filePath = file.filepath || file.path;
-        }
-      }
 
-      const responseFormat = _.defaultTo(response_format, "url");
-      const imageUrls = await generateImagesWithRetry(model, prompt, {
+      const files = request.files || {};
+      const filePath = bodyFilePath || firstUploadedFilePath(files as any);
+
+      return createImageGenerationResponse({
+        model,
+        prompt,
+        negativePrompt,
         ratio,
         resolution,
         sampleStrength,
-        negativePrompt,
+        responseFormat: _.defaultTo(response_format, "url"),
         filePath,
-      }, token);
-      
-      // 记录统计和媒体
-      try {
-        db.recordCall(token, model, 0);
-        imageUrls.forEach(url => {
-          if (url) db.saveMedia('image', url, model, prompt, token);
-        });
-      } catch (e) {
-        // 忽略数据库错误，不影响主流程
-      }
-      
-      let data = [];
-      if (responseFormat == "b64_json") {
-        data = (
-          await Promise.all(imageUrls.map((url) => util.fetchFileBASE64(url)))
-        ).map((b64) => ({ b64_json: b64 }));
-      } else {
-        data = imageUrls.map((url) => ({
-          url,
-        }));
-      }
-      return {
-        created: util.unixTimestamp(),
-        data,
-      };
+      }, chooseToken(request.headers.authorization));
+    },
+
+    "/edits": async (request: Request) => {
+      request
+        .validate("body.model", v => _.isUndefined(v) || _.isString(v))
+        .validate("body.prompt", _.isString)
+        .validate("body.negative_prompt", v => _.isUndefined(v) || _.isString(v))
+        .validate("body.size", v => _.isUndefined(v) || _.isString(v))
+        .validate("body.response_format", v => _.isUndefined(v) || _.isString(v))
+        .validate("headers.authorization", _.isString);
+
+      const generationRequest = toImageEditGenerationRequest({
+        body: request.body,
+        files: request.files || {},
+      });
+
+      return createImageGenerationResponse(
+        generationRequest,
+        chooseToken(request.headers.authorization)
+      );
     },
   },
 };
