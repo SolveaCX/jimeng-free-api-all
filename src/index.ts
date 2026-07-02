@@ -6,6 +6,7 @@ import "@/lib/initialize.ts";
 import server from "@/lib/server.ts";
 import routes from "@/api/routes/index.ts";
 import logger from "@/lib/logger.ts";
+import { startVideoTaskWorker } from "@/lib/video-task-worker.ts";
 
 const startupTime = performance.now();
 
@@ -19,6 +20,7 @@ const startupTime = performance.now();
   logger.info("Service name:", config.service.name);
 
   server.attachRoutes(routes);
+  startVideoTaskWorker();
   await server.listen();
 
   config.service.bindAddress &&

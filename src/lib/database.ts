@@ -64,11 +64,33 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now', 'localtime'))
   );
 
+  -- 异步视频任务表
+  CREATE TABLE IF NOT EXISTS video_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT UNIQUE NOT NULL,
+    history_id TEXT,
+    status TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    token TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    token_preview TEXT NOT NULL,
+    request_json TEXT,
+    result_url TEXT,
+    error TEXT,
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+    finished_at TEXT
+  );
+
   -- 创建索引
   CREATE INDEX IF NOT EXISTS idx_key_stats_key ON key_stats(key_hash);
   CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
   CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_video_tasks_task_id ON video_tasks(task_id);
+  CREATE INDEX IF NOT EXISTS idx_video_tasks_status ON video_tasks(status);
+  CREATE INDEX IF NOT EXISTS idx_video_tasks_updated ON video_tasks(updated_at DESC);
 `);
 
 // 密码哈希
@@ -248,6 +270,142 @@ export function clearLogs(): void {
   db.prepare('DELETE FROM logs').run();
 }
 
+export type VideoTaskStatus = 'QUEUED' | 'IN_PROGRESS' | 'SUCCESS' | 'FAILURE';
+
+export interface VideoTaskRecord {
+  id?: number;
+  task_id: string;
+  history_id?: string | null;
+  status: VideoTaskStatus;
+  model: string;
+  prompt: string;
+  token: string;
+  token_hash: string;
+  token_preview: string;
+  request?: any;
+  result_url?: string | null;
+  error?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  finished_at?: string | null;
+}
+
+export interface CreateVideoTaskInput {
+  taskId: string;
+  historyId?: string | null;
+  status: VideoTaskStatus;
+  model: string;
+  prompt: string;
+  token: string;
+  request?: any;
+}
+
+export interface UpdateVideoTaskInput {
+  historyId?: string | null;
+  status?: VideoTaskStatus;
+  resultUrl?: string | null;
+  error?: string | null;
+  request?: any;
+  finished?: boolean;
+}
+
+function mapVideoTask(row: any): VideoTaskRecord | null {
+  if (!row) return null;
+  let request: any = {};
+  if (row.request_json) {
+    try {
+      request = JSON.parse(row.request_json);
+    } catch {
+      request = {};
+    }
+  }
+  return {
+    id: row.id,
+    task_id: row.task_id,
+    history_id: row.history_id,
+    status: row.status,
+    model: row.model,
+    prompt: row.prompt,
+    token: row.token,
+    token_hash: row.token_hash,
+    token_preview: row.token_preview,
+    request,
+    result_url: row.result_url,
+    error: row.error,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    finished_at: row.finished_at,
+  };
+}
+
+export function createVideoTask(input: CreateVideoTaskInput): VideoTaskRecord {
+  db.prepare(`
+    INSERT INTO video_tasks (
+      task_id, history_id, status, model, prompt, token, token_hash,
+      token_preview, request_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.taskId,
+    input.historyId || null,
+    input.status,
+    input.model,
+    input.prompt,
+    input.token,
+    hashKey(input.token),
+    keyPreview(input.token),
+    JSON.stringify(input.request || {})
+  );
+  return getVideoTask(input.taskId)!;
+}
+
+export function getVideoTask(taskId: string): VideoTaskRecord | null {
+  const row = db.prepare('SELECT * FROM video_tasks WHERE task_id = ?').get(taskId);
+  return mapVideoTask(row);
+}
+
+export function updateVideoTask(taskId: string, input: UpdateVideoTaskInput): VideoTaskRecord | null {
+  const fields: string[] = ['updated_at = datetime(\'now\', \'localtime\')'];
+  const params: any[] = [];
+
+  if (Object.prototype.hasOwnProperty.call(input, 'historyId')) {
+    fields.push('history_id = ?');
+    params.push(input.historyId || null);
+  }
+  if (input.status) {
+    fields.push('status = ?');
+    params.push(input.status);
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'resultUrl')) {
+    fields.push('result_url = ?');
+    params.push(input.resultUrl || null);
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'error')) {
+    fields.push('error = ?');
+    params.push(input.error || null);
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'request')) {
+    fields.push('request_json = ?');
+    params.push(JSON.stringify(input.request || {}));
+  }
+  if (input.finished) {
+    fields.push('finished_at = datetime(\'now\', \'localtime\')');
+  }
+
+  params.push(taskId);
+  db.prepare(`UPDATE video_tasks SET ${fields.join(', ')} WHERE task_id = ?`).run(...params);
+  return getVideoTask(taskId);
+}
+
+export function listUnfinishedVideoTasks(limit: number = 20): VideoTaskRecord[] {
+  const rows = db.prepare(`
+    SELECT * FROM video_tasks
+    WHERE status IN ('QUEUED', 'IN_PROGRESS')
+    ORDER BY updated_at ASC, id ASC
+    LIMIT ?
+  `).all(limit);
+  return rows.map(mapVideoTask).filter(Boolean) as VideoTaskRecord[];
+}
+
 export default {
   isSetupComplete,
   createUser,
@@ -262,5 +420,9 @@ export default {
   getMedia,
   addLog,
   getLogs,
-  clearLogs
+  clearLogs,
+  createVideoTask,
+  getVideoTask,
+  updateVideoTask,
+  listUnfinishedVideoTasks
 };

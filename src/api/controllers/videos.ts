@@ -6,6 +6,13 @@ import util from "@/lib/util.ts";
 import { getCredit, receiveCredit, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
 import { JimengModelConfig, resolveVideoModelConfig } from "./models.ts";
+import {
+  normalizeVideoPollResult,
+  VIDEO_PROCESSING_STATES,
+  extractVideoUrlFromItemList,
+  extractVideoUrlFromResponse,
+  type VideoPollResult,
+} from "./video-poll.ts";
 
 const DEFAULT_ASSISTANT_ID = 513695;
 export const DEFAULT_MODEL = "jimeng-video-seedance-2.0-mini";
@@ -146,33 +153,6 @@ function getVideoResolutionFallbacks(
   return supportedResolutions.slice(startIndex);
 }
 
-const VIDEO_PROCESSING_STATES = [20, 42, 45];
-
-function extractVideoUrlFromItemList(itemList: any[] = []) {
-  for (const item of itemList) {
-    const url =
-      item?.video?.transcoded_video?.origin?.video_url ||
-      item?.video?.play_url ||
-      item?.video?.download_url ||
-      item?.video?.url;
-    if (url) return url;
-  }
-}
-
-function extractVideoUrlFromResponse(result: any) {
-  const historyRecords = [
-    ...(result?.history_list || []),
-    ...(result?.history_records || []),
-  ];
-  for (const record of historyRecords) {
-    const url = extractVideoUrlFromItemList(record?.item_list || []);
-    if (url) return url;
-  }
-
-  const responseStr = JSON.stringify(result);
-  return responseStr.match(/https:\/\/[^"\s]+(?:vlabvod|vod)[^"\s]+/)?.[0];
-}
-
 // 视频支持的比例列表
 const VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"];
 
@@ -237,6 +217,298 @@ function detectVideoDuration(prompt: string): number | null {
  * @param refreshToken 刷新令牌
  * @returns 视频URL
  */
+export interface VideoGenerationOptions {
+  ratio?: string;
+  resolution?: string;
+  duration?: number;
+  filePaths?: string[];
+}
+
+export interface VideoSubmitResult {
+  historyId: string;
+  request: {
+    model: string;
+    upstreamModel: string;
+    prompt: string;
+    ratio: string;
+    resolution: string;
+    duration: number;
+    durationMs: number;
+    filePaths: string[];
+  };
+}
+
+async function resolveVideoRequest(
+  _model: string,
+  prompt: string,
+  {
+    ratio = "16:9",
+    resolution = "720p",
+    duration = 10,
+    filePaths = [],
+  }: VideoGenerationOptions,
+  refreshToken: string
+) {
+  const modelConfig = await resolveVideoModelConfig(_model, refreshToken);
+  const model = modelConfig.modelReqKey || getModel(_model);
+  let finalResolution = resolution;
+  if (!modelConfig.supportedResolutions.includes(finalResolution)) {
+    logger.warn(
+      `视频模型 ${_model} 不支持分辨率 ${resolution}，已调整为 ${modelConfig.defaultResolution}`
+    );
+    finalResolution = modelConfig.defaultResolution;
+  }
+
+  let videoAspectRatio = ratio;
+  if (!VIDEO_ASPECT_RATIOS.includes(ratio)) {
+    const detected = detectVideoAspectRatio(prompt);
+    videoAspectRatio = VIDEO_ASPECT_RATIOS.includes(detected) ? detected : "16:9";
+  }
+
+  const supportsLongDuration = modelConfig.supportsLongDuration;
+  let finalDuration = duration;
+  if (!supportsLongDuration) {
+    finalDuration = 5;
+    if (duration !== 5) {
+      logger.info("2.0 系列视频模型只支持 5 秒，已自动调整");
+    }
+  } else {
+    const detectedDuration = detectVideoDuration(prompt);
+    if (detectedDuration !== null && duration === 10) {
+      finalDuration = detectedDuration;
+    }
+  }
+
+  if (![5, 10].includes(finalDuration)) {
+    finalDuration = finalDuration > 5 ? 10 : 5;
+  }
+
+  return {
+    modelConfig,
+    model,
+    finalResolution,
+    videoAspectRatio,
+    finalDuration,
+    durationMs: finalDuration === 5 ? 5000 : 10000,
+    filePaths,
+  };
+}
+
+async function buildVideoFrameImages(filePaths: string[], refreshToken: string) {
+  let first_frame_image = undefined;
+  let end_frame_image = undefined;
+
+  if (filePaths && filePaths.length > 0) {
+    const imageTypes = filePaths.map((p) =>
+      p.startsWith("data:") ? "base64" : p.startsWith("http") ? "url" : "file"
+    );
+    logger.info(
+      `接收到 ${filePaths.length} 张图片用于首尾帧，类型: ${JSON.stringify(
+        imageTypes
+      )}`
+    );
+    let uploadIDs: string[] = [];
+
+    for (let i = 0; i < filePaths.length; i++) {
+      const filePath = filePaths[i];
+      if (!filePath) continue;
+      try {
+        const uploadResult = await uploadFile(refreshToken, filePath);
+        if (uploadResult && uploadResult.image_uri) {
+          uploadIDs.push(uploadResult.image_uri);
+        }
+      } catch (e) {
+        logger.error(`上传失败: ${e.message}`);
+        if (i === 0)
+          throw new APIException(EX.API_REQUEST_FAILED, "首帧上传失败");
+      }
+    }
+
+    if (uploadIDs[0]) {
+      first_frame_image = {
+        format: "",
+        height: 1024,
+        id: util.uuid(),
+        image_uri: uploadIDs[0],
+        name: "",
+        platform_type: 1,
+        source_from: "upload",
+        type: "image",
+        uri: uploadIDs[0],
+        width: 1024,
+      };
+    }
+    if (uploadIDs[1]) {
+      end_frame_image = {
+        format: "",
+        height: 1024,
+        id: util.uuid(),
+        image_uri: uploadIDs[1],
+        name: "",
+        platform_type: 1,
+        source_from: "upload",
+        type: "image",
+        uri: uploadIDs[1],
+        width: 1024,
+      };
+    }
+  }
+
+  return { first_frame_image, end_frame_image };
+}
+
+export async function submitVideoGeneration(
+  _model: string,
+  prompt: string,
+  options: VideoGenerationOptions,
+  refreshToken: string
+): Promise<VideoSubmitResult> {
+  const resolved = await resolveVideoRequest(_model, prompt, options, refreshToken);
+
+  logger.info(
+    `使用模型: ${_model} 映射模型: ${resolved.model} 分辨率: ${resolved.finalResolution} 比例: ${resolved.videoAspectRatio} 时长: ${resolved.durationMs}ms (${resolved.finalDuration}秒)`
+  );
+
+  const { totalCredit } = await getCredit(refreshToken);
+  if (totalCredit <= 0) await receiveCredit(refreshToken);
+
+  const { first_frame_image, end_frame_image } = await buildVideoFrameImages(
+    resolved.filePaths,
+    refreshToken
+  );
+
+  const componentId = util.uuid();
+  const metricsExtra = JSON.stringify({
+    enterFrom: "click",
+    isDefaultSeed: 1,
+    promptSource: "custom",
+    isRegenerate: false,
+    originSubmitId: util.uuid(),
+  });
+  const videoCommerceInfo = getVideoCommerceInfoFromConfig(resolved.modelConfig, resolved.finalResolution);
+
+  const { aigc_data } = await request(
+    "post",
+    "/mweb/v1/aigc_draft/generate",
+    refreshToken,
+    {
+      params: {
+        aigc_features: "app_lip_sync",
+        web_version: WEB_VERSION,
+        da_version: DRAFT_VERSION,
+        web_component_open_flag: 1,
+      },
+      data: {
+        extend: {
+          root_model: resolved.model,
+          m_video_commerce_info: videoCommerceInfo,
+          m_video_commerce_info_list: [videoCommerceInfo],
+        },
+        submit_id: util.uuid(),
+        metrics_extra: metricsExtra,
+        draft_content: JSON.stringify({
+          type: "draft",
+          id: util.uuid(),
+          min_version: "3.0.5",
+          is_from_tsn: true,
+          version: DRAFT_VERSION,
+          main_component_id: componentId,
+          component_list: [
+            {
+              type: "video_base_component",
+              id: componentId,
+              min_version: "1.0.0",
+              metadata: {
+                type: "",
+                id: util.uuid(),
+                created_platform: 3,
+                created_platform_version: "",
+                created_time_in_ms: Date.now(),
+                created_did: "",
+              },
+              generate_type: "gen_video",
+              aigc_mode: "workbench",
+              abilities: {
+                type: "",
+                id: util.uuid(),
+                gen_video: {
+                  id: util.uuid(),
+                  type: "",
+                  text_to_video_params: {
+                    type: "",
+                    id: util.uuid(),
+                    model_req_key: resolved.model,
+                    priority: 0,
+                    seed: Math.floor(Math.random() * 100000000) + 2500000000,
+                    video_aspect_ratio: resolved.videoAspectRatio,
+                    video_gen_inputs: [
+                      {
+                        duration_ms: resolved.durationMs,
+                        first_frame_image,
+                        end_frame_image,
+                        fps: 24,
+                        id: util.uuid(),
+                        min_version: "3.0.5",
+                        prompt,
+                        resolution: resolved.finalResolution,
+                        type: "",
+                        video_mode: 2,
+                      },
+                    ],
+                  },
+                  video_task_extra: metricsExtra,
+                },
+              },
+            },
+          ],
+        }),
+        http_common_info: {
+          aid: Number(DEFAULT_ASSISTANT_ID),
+        },
+      },
+    }
+  );
+
+  const historyId = aigc_data?.history_record_id;
+  if (!historyId)
+    throw new APIException(EX.API_VIDEO_GENERATION_FAILED, "记录ID不存在");
+
+  return {
+    historyId,
+    request: {
+      model: _model,
+      upstreamModel: resolved.model,
+      prompt,
+      ratio: resolved.videoAspectRatio,
+      resolution: resolved.finalResolution,
+      duration: resolved.finalDuration,
+      durationMs: resolved.durationMs,
+      filePaths: resolved.filePaths,
+    },
+  };
+}
+
+export async function pollVideoGeneration(
+  historyId: string,
+  refreshToken: string,
+  useAlternativeApi = false
+): Promise<VideoPollResult> {
+  const result = useAlternativeApi
+    ? await request(
+        "post",
+        "/mweb/v1/get_history_records",
+        refreshToken,
+        {
+          data: { history_record_ids: [historyId] },
+        }
+      )
+    : await request("post", "/mweb/v1/get_history_by_ids", refreshToken, {
+        data: { history_ids: [historyId] },
+      });
+
+  return normalizeVideoPollResult(result);
+}
+
 export async function generateVideo(
   _model: string,
   prompt: string,

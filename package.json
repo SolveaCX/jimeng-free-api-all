@@ -15,7 +15,8 @@
   "scripts": {
     "dev": "tsup src/index.ts --format cjs,esm --sourcemap --dts --publicDir public --watch --onSuccess \"node --enable-source-maps --no-node-snapshot dist/index.js\"",
     "start": "node --enable-source-maps --no-node-snapshot dist/index.js",
-    "build": "tsup src/index.ts --format cjs,esm --sourcemap --dts --clean --publicDir public"
+    "build": "tsup src/index.ts --format cjs,esm --sourcemap --dts --clean --publicDir public",
+    "test:async-video-tasks": "tsup src/__tests__/async-video-tasks.test.ts --format esm --platform node --out-dir dist-tests --clean && node --test dist-tests/async-video-tasks.test.js"
   },
   "author": "Vinlic",
   "license": "ISC",
